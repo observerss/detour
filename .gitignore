@@ -1,0 +1,6 @@
+**/dist/*
+**/build/*
+**/.mypy_cache/*
+**/__pycache__/*
+*.log
+*.pyc

@@ -1,0 +1,19 @@
+[project]
+name = "detour"
+description = "detour"
+version = "0.1.0"
+authors = [
+    { name = "Jingchao Hu", email = "jingchaohu@gmail.com" }
+]
+dependencies = [
+    "pyzmq",
+    "orjson"
+]
+
+[project.optional-dependencies]
+dev = [
+]
+
+[build-system]
+build-backend = "flit_core.buildapi"
+requires = ["flit_core >=3.2,<4"]
