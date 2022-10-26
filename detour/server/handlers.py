@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 from fileinput import close
 import random
+import socket
 import asyncio
 from typing import Dict
 
@@ -21,7 +22,18 @@ CONNECTIONS: Dict[
 async def handle_connect(req: RelayRequest) -> RelayResponse:
     resp = RelayResponse(method=req.method)
     try:
-        reader, writer = await asyncio.open_connection(req.addr, req.port)
+        addr = req.addr
+        # dns first
+        # try:
+        #     int(req.addr.split(".")[0])
+        #     addr = req.addr
+        # except:
+        #     res = await asyncio.get_running_loop().getaddrinfo(
+        #         req.addr, req.port, proto=socket.IPPROTO_TCP
+        #     )
+        #     addr = res[0][-1][0]
+
+        reader, writer = await asyncio.open_connection(addr, req.port)
     except Exception as e:
         resp.ok = False
         msg = f"open ({req.addr}, {req.port}) failed: {str(e)}"
@@ -44,7 +56,7 @@ async def handle_connect(req: RelayRequest) -> RelayResponse:
         connection = f"tcp://{server_ip}:{port}"
         CONNECTIONS[connection] = (conn, reader, writer)
 
-        logger.debug(f"[{connection}] open connection ({req.addr}, {req.port})")
+        logger.debug(f"[{connection}] open connection ({addr}, {req.port})")
 
         # spawn forwarders
         asyncio.create_task(forward_reader(connection, conn, reader))
@@ -76,13 +88,37 @@ async def forward_reader(
 ):
     while True:
         try:
-            data = await reader.read(random.randint(minsize, maxsize))
+            # DO NOT CHANGE 16384, it's a shadowsocks hack
+            data = await reader.read(16384)
         except ConnectionResetError:
             break
         except Exception as e:
             msg = f"[{connection}] unexpected error from remote: {str(e)}"
             logger.exception(msg)
             break
+
+        # split data into small packages
+        offset = 0
+        total = len(data)
+        while offset < total:
+            size = random.randint(minsize, maxsize)
+
+            print(">>>>>>>>>>>>", offset, total, size)
+            part = data[offset : offset + size]
+            offset += size
+
+            logger.debug(
+                f"[{connection}] remote => local: {len(part)}, eos={offset >= total}, {part[:100]}"
+            )
+
+            resp = RelayData(data=part, eos=offset >= total)
+            try:
+                await conn.send_multipart(pack(obfs(resp)))
+            except zmq.error.ZMQError:
+                logger.exception(f"[{connection}] zmq already closed (reader)")
+                await close_connection(connection)
+                logger.debug(f"[{connection}] closed reader with remote")
+                return
 
         # logger.debug(f"[{connection}] remote => local: {len(data)}, {data[:100]}")
 
@@ -103,22 +139,35 @@ async def forward_writer(
     conn: zmq.Socket,
     writer: asyncio.StreamWriter,
 ):
-    while True:
-        try:
-            msg = await conn.recv_multipart()
-        except Exception as e:
-            msg = f"[{connection}] unexpected error from local: {str(e)}"
-            logger.exception(msg)
-            break
+    outer_looping = True
+    while outer_looping:
+        parts = []
+        while True:
+            try:
+                data = await conn.recv_multipart()
+            except Exception as e:
+                msg = f"[{connection}] unexpected error from local: {str(e)}"
+                logger.exception(msg)
+                outer_looping = False
+                continue
 
-        resp = deobfs(unpack_data(msg))
-        # logger.debug(
-        #     f"[{connection}] local => remote: {len(resp.data)}, {resp.data[:100]}"
-        # )
-        if resp.method == RelayMethod.CLOSE:
-            break
+            resp = deobfs(unpack_data(data))
+            if resp.method == RelayMethod.CLOSE:
+                outer_looping = False
+                continue
 
-        writer.write(resp.data)
+            logger.debug(
+                f"[{connection}] local => remote: {len(resp.data)}, eos={resp.eos}, {resp.data[:100]}"
+            )
+
+            # data are splited in server
+            parts.append(resp.data)
+            if resp.eos:
+                break
+
+        data = b"".join(parts)
+        print("write", len(data), data[:100])
+        writer.write(data)
 
         # do not add drain
         # it will slow down the program
@@ -149,9 +198,9 @@ async def close_connection(connection: str):
                 await asyncio.sleep(seconds)
                 conn.close()
 
-            asyncio.create_task(close_later(1))
+            asyncio.create_task(close_later(seconds=10))
         except zmq.error.ZMQError:
-            pass
+            logger.exception("zmq socket already closed")
 
 
 HANDLERS = {

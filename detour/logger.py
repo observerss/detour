@@ -63,7 +63,7 @@ logging.config.dictConfig(
                 "handlers": ["console", "file"],
             },
         },
-        "disable_existing_loggers": False,
+        "disable_existing_loggers": True,
     }
 )
 

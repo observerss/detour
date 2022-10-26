@@ -24,9 +24,12 @@ class Config(TypedDict):
     server_min_port: int
     server_max_port: int
     client_connects: List[str]
-    client_listen: str
-    client_username: str
-    client_password: str
+    client_listen_socks5: str
+    client_listen_shadow: str
+    client_socks5_username: str
+    client_socks5_password: str
+    client_shadow_method: str
+    client_shadow_password: str
 
 
 @dataclass
@@ -99,6 +102,7 @@ class RelayResponse:
 class RelayData:
     method: str = RelayMethod.DATA  # DATA/CLOSE
     padding: int = 0  # padding length
+    eos: bool = False  # end of stream
     swaps: bytes = b""  # swaps length must be even
     data: bytes = b""  # response data, only valid in DATA
     data_obfs: bytes = b""
@@ -116,6 +120,7 @@ class RelayData:
                 [
                     self.method,
                     self.padding,
+                    self.eos,
                 ]
             ),
             self.swaps,

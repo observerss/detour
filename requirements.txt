@@ -10,3 +10,5 @@ orjson==3.8.0
     # via detour (pyproject.toml)
 pyzmq==24.0.1
     # via detour (pyproject.toml)
+shadowsocks @ git+https://github.com/shadowsocks/shadowsocks.git@master
+    # via detour (pyproject.toml)

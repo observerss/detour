@@ -21,7 +21,7 @@ from ..logger import logger
 DOWN_STREAM_BUF_SIZE = 32 * 1024
 
 
-async def handle_shadow(
+async def negotiate_shadow(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
     bind: Callable[[Socks5Request], Coroutine[Any, Any, Address]],

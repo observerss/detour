@@ -8,8 +8,11 @@ TOKEN_TRANSLATE = b"\xcd7\x9b\xb6\xadX\x16/^\xe2\x80\x9c\xaf\xa4\xc4\xc16\x054\x
 DEFAULT_TOKEN = "LzHAxq0KtWM"
 SERVER_LISTEN = "tcp://0.0.0.0:3171"
 CLIENT_CONNECTS = "tcp://127.0.0.1:3171"
-CLIENT_LISTEN = "tcp://127.0.0.1:3170"
+CLIENT_LISTEN_SOCKS5 = "tcp://127.0.0.1:3170"
+CLIENT_LISTEN_SHADOW = "tcp://127.0.0.1:3169"
 LOGGING_LEVEL = "DEBUG"
+SHADOW_PASSWORD = "yb160101"
+SHADOW_METHOD = "chacha20-ietf-poly1305"
 
 
 def get_config() -> Config:
@@ -27,9 +30,24 @@ def get_config() -> Config:
             ","
         )
     ]
-    conf["client_listen"] = os.environ.get("DETOUR_CLIENT_LISTEN", CLIENT_LISTEN)
-    conf["client_username"] = os.environ.get("DETOUR_CLIENT_USERNAME", None)
-    conf["client_password"] = os.environ.get("DETOUR_CLIENT_PASSWORD", None)
+    conf["client_listen_socks5"] = os.environ.get(
+        "DETOUR_CLIENT_LISTEN_SOCKS5", CLIENT_LISTEN_SOCKS5
+    )
+    conf["client_listen_shadow"] = os.environ.get(
+        "DETOUR_CLIENT_LISTEN_SHADOW", CLIENT_LISTEN_SHADOW
+    )
+    conf["client_socks5_username"] = os.environ.get(
+        "DETOUR_CLIENT_SOCKS5_USERNAME", None
+    )
+    conf["client_socks5_password"] = os.environ.get(
+        "DETOUR_CLIENT_SOCKS5_PASSWORD", None
+    )
+    conf["client_shadow_password"] = os.environ.get(
+        "DETOUR_CLIENT_SHADOW_PASSWORD", SHADOW_PASSWORD
+    )
+    conf["client_shadow_method"] = os.environ.get(
+        "DETOUR_CLIENT_SHADOW_METHOD", SHADOW_METHOD
+    )
 
     conf["swaps_add_length"] = 16
     conf["min_padding_length"] = 320

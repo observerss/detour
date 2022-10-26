@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-from cmath import log
+"""
+Socks5 Server
+"""
 import enum
 import struct
 import socket
@@ -93,22 +95,27 @@ async def negotiate_socks(
     sockname = writer.get_extra_info("sockname")
     listen = f"tcp://{sockname[0]}:{sockname[1]}"
     peer = f"tcp://{peername[0]}:{peername[1]}"
-    logger.debug(f"[{listen}] handshaking {peer} ...")
+
+    logger.debug(f"[{listen}] socks5 handshaking {peer} ...")
+
     ok = await handshake(reader, writer)
     if not ok:
         return False
-    logger.debug(f"[{listen}] handshake {peer} ok")
+
+    logger.debug(f"[{listen}] socks5 handshake {peer} ok")
 
     req = await get_request(reader, writer)
     if not req:
         return False
-    logger.debug(f"[{listen}] recv <=== {peer}: {req}")
+
+    logger.debug(f"[{listen}] socks5 recv <=== {peer}: {req}")
 
     try:
         addr = await bind(req)
     except Exception as e:
         logger.exception(str(e))
         writer.write(GENERAL_FAILURE)
+        return False
     else:
         writer.write(addr.to_bytes())
         await writer.drain()
@@ -131,7 +138,7 @@ async def handshake(
     for _ in range(nmethods):
         methods.add(ord(await reader.read(1)))
 
-    if conf["client_username"] and conf["client_password"]:
+    if conf["client_socks5_username"] and conf["client_socks5_password"]:
         if AuthType.USERNAME_PASSWORD not in methods:
             writer.write(NO_ACCEPTABLE_METHOD)
             return False
@@ -160,7 +167,10 @@ async def check_auth_userpass(
     password_len = ord(await reader.read(1))
     password = (await reader.read(password_len)).decode("utf-8")
 
-    if username == conf["client_username"] and password == conf["client_password"]:
+    if (
+        username == conf["client_socks5_username"]
+        and password == conf["client_socks5_password"]
+    ):
         # success, status = 0
         writer.write(struct.pack("!BB", version, 0))
         return True
@@ -178,12 +188,15 @@ async def get_request(
 
     if address_type == AddrType.IPv4:
         address = socket.inet_ntoa(await reader.read(4))
+    elif address_type == AddrType.IPv6:
+        address = socket.inet_ntop(socket.AF_INET6, await reader.read(16))
     elif address_type == AddrType.DOMAIN:
         domain_length = ord(await reader.read(1))
         address = await reader.read(domain_length)
         address = address.decode()
     else:
         writer.write(ADDRESS_TYPE_NOT_SUPPPORTED)
+        return
 
     port = struct.unpack("!H", await reader.read(2))[0]
 
