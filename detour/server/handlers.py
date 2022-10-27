@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+from fileinput import close
 import random
 import asyncio
 from typing import Dict
@@ -23,8 +24,9 @@ async def handle_connect(req: RelayRequest) -> RelayResponse:
         reader, writer = await asyncio.open_connection(req.addr, req.port)
     except Exception as e:
         resp.ok = False
-        resp.msg = str(e)
-        logger.exception(str(e))
+        msg = f"open ({req.addr}, {req.port}) failed: {str(e)}"
+        resp.msg = msg
+        logger.exception(resp.msg)
     else:
         conf = get_config()
         ctx = Context.instance()
@@ -76,23 +78,23 @@ async def forward_reader(
         try:
             data = await reader.read(random.randint(minsize, maxsize))
         except ConnectionResetError:
-            await close_connection(connection)
             break
         except Exception as e:
             msg = f"[{connection}] unexpected error from remote: {str(e)}"
             logger.exception(msg)
-            await close_connection(connection)
-            break
-
-        if not data:
-            logger.debug(f"[{connection}] empty response from remote")
-            await close_connection(connection)
             break
 
         # logger.debug(f"[{connection}] remote => local: {len(data)}, {data[:100]}")
-        resp = RelayData(data=data)
-        await conn.send_multipart(pack(obfs(resp)))
 
+        resp = RelayData(data=data)
+        msg = pack(obfs(resp))
+        await conn.send_multipart(msg)
+
+        if not data:
+            logger.debug(f"[{connection}] empty response from remote")
+            break
+
+    await close_connection(connection)
     logger.debug(f"[{connection}] closed reader with remote")
 
 
@@ -103,14 +105,13 @@ async def forward_writer(
 ):
     while True:
         try:
-            data = await conn.recv_multipart()
+            msg = await conn.recv_multipart()
         except Exception as e:
             msg = f"[{connection}] unexpected error from local: {str(e)}"
             logger.exception(msg)
-            await close_connection(connection)
             break
 
-        resp = deobfs(unpack_data(data))
+        resp = deobfs(unpack_data(msg))
         # logger.debug(
         #     f"[{connection}] local => remote: {len(resp.data)}, {resp.data[:100]}"
         # )
@@ -123,7 +124,7 @@ async def forward_writer(
         # it will slow down the program
         # await writer.drain()
 
-    conn.close()
+    await close_connection(connection)
     try:
         await writer.drain()
     except:
@@ -143,6 +144,12 @@ async def close_connection(connection: str):
             await conn.send_multipart(
                 pack(obfs(RelayData(method=RelayMethod.CLOSE, data=b"close")))
             )
+
+            async def close_later(seconds: float = 1):
+                await asyncio.sleep(seconds)
+                conn.close()
+
+            asyncio.create_task(close_later(1))
         except zmq.error.ZMQError:
             pass
 

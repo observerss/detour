@@ -19,7 +19,7 @@ from .handlers import HANDLERS
 async def run_server():
     conf = get_config()
     ctx = Context.instance()
-    conn = ctx.socket(zmq.REP)
+    conn = ctx.socket(zmq.ROUTER)
     connection = conf["server_listen"]
     conn.bind(connection)
 
@@ -41,25 +41,38 @@ async def run_server():
             msg, listen = await get_msg_and_listen(conn, listen)
             got_listen = True
 
+        # msg[0] is zmq identity
+        msgid, msg = msg[0], msg[1:]
         try:
             req = cast(RelayRequest, deobfs(unpack_request(msg)))
             req.connection = f"tcp://{listen[0]}:{listen[1]}"
-            resp = await HANDLERS[req.method](req)
         except Exception as e:
-            msg = f"unhandled error: {str(e)}"
+            msg = f"Bad Request"
             logger.exception(msg)
             resp = RelayResponse(
-                method=req.method, ok=False, msg=msg, data=b"random stuff"
+                method=RelayMethod.CONNECT, ok=False, msg=msg, data=b"random stuff"
             )
+            msg_back = pack(obfs(resp))
+            await conn.send_multipart([msgid] + msg_back)
+        else:
+            asyncio.create_task(handle_request(conn, req, msgid))
 
-        msg_back = pack(obfs(resp))
-        await conn.send_multipart(msg_back)
+
+async def handle_request(conn: zmq.Socket, req: RelayRequest, msgid: bytes):
+    try:
+        resp = await HANDLERS[req.method](req)
+    except Exception as e:
+        msg = f"unhandled error: {str(e)}"
+        logger.exception(msg)
+        resp = RelayResponse(method=req.method, ok=False, msg=msg, data=b"random stuff")
+    msg_back = pack(obfs(resp))
+    await conn.send_multipart([msgid] + msg_back)
 
 
 async def get_msg_and_listen(conn: zmq.Socket, listen: str):
     msg = cast(List[zmq.Frame], await conn.recv_multipart(copy=False))
 
-    fileno = msg[0].get(zmq.SRCFD)
+    fileno = msg[1].get(zmq.SRCFD)
     try:
         fileno2 = os.dup(fileno)
     except OSError:

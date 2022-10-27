@@ -84,7 +84,7 @@ class Address:
             raise NotImplementedError("")
 
 
-async def handle_socks(
+async def negotiate_socks(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
     bind: Callable[[Socks5Request], Coroutine[Any, Any, Address]],
@@ -96,15 +96,11 @@ async def handle_socks(
     logger.debug(f"[{listen}] handshaking {peer} ...")
     ok = await handshake(reader, writer)
     if not ok:
-        await writer.drain()
-        writer.close()
         return False
     logger.debug(f"[{listen}] handshake {peer} ok")
 
     req = await get_request(reader, writer)
     if not req:
-        await writer.drain()
-        writer.close()
         return False
     logger.debug(f"[{listen}] recv <=== {peer}: {req}")
 
@@ -113,8 +109,6 @@ async def handle_socks(
     except Exception as e:
         logger.exception(str(e))
         writer.write(GENERAL_FAILURE)
-        await writer.drain()
-        writer.close()
     else:
         writer.write(addr.to_bytes())
         await writer.drain()
