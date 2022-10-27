@@ -1,0 +1,9 @@
+{
+  "server": "0.0.0.0",
+  "mode": "tcp_only",
+  "nameserver": "223.5.5.5",
+  "server_port": 11903,
+  "password": "yb160101",
+  "timeout": 60,
+  "method": "chacha20-ietf-poly1305"
+}
