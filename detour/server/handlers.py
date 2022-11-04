@@ -1,8 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-from fileinput import close
+import time
 import random
-import socket
 import asyncio
 from typing import Dict
 
@@ -13,10 +12,20 @@ from ..config import get_config
 from ..logger import logger
 from ..schema import RelayData, RelayRequest, RelayResponse, RelayMethod
 from ..relay import obfs, deobfs, pack, unpack_data
+from ..utils import logs_error
 
 CONNECTIONS: Dict[
-    str, tuple[zmq.Socket, asyncio.StreamReader, asyncio.StreamWriter]
+    str,
+    tuple[
+        zmq.Socket,
+        asyncio.StreamReader,
+        asyncio.StreamWriter,
+        asyncio.Task,
+        asyncio.Task,
+    ],
 ] = {}
+UP_STREAM_BUF_SIZE = 16 * 1024
+LAST_ACTIVITY_TIMES: Dict[str, float] = {}
 
 
 async def handle_connect(req: RelayRequest) -> RelayResponse:
@@ -43,6 +52,7 @@ async def handle_connect(req: RelayRequest) -> RelayResponse:
         conf = get_config()
         ctx = Context.instance()
         conn = ctx.socket(zmq.PAIR)
+        conn.setsockopt(zmq.LINGER, 0)
         assert req.connection.startswith(
             "tcp://"
         ), "connection should startswith tcp://"
@@ -54,13 +64,15 @@ async def handle_connect(req: RelayRequest) -> RelayResponse:
         )
 
         connection = f"tcp://{server_ip}:{port}"
-        CONNECTIONS[connection] = (conn, reader, writer)
+        # spawn forwarders
+        taskr = asyncio.create_task(forward_reader(connection, conn, reader))
+        taskw = asyncio.create_task(forward_writer(connection, conn, writer))
+
+        imalive(connection)
+
+        CONNECTIONS[connection] = (conn, reader, writer, taskr, taskw)
 
         logger.debug(f"[{connection}] open connection ({addr}, {req.port})")
-
-        # spawn forwarders
-        asyncio.create_task(forward_reader(connection, conn, reader))
-        asyncio.create_task(forward_writer(connection, conn, writer))
 
         # make response body
         resp.ok = True
@@ -79,6 +91,7 @@ async def handle_close(req: RelayRequest) -> RelayResponse:
     return resp
 
 
+@logs_error
 async def forward_reader(
     connection: str,
     conn: zmq.Socket,
@@ -88,8 +101,8 @@ async def forward_reader(
 ):
     while True:
         try:
-            # DO NOT CHANGE 16384, it's a shadowsocks hack
-            data = await reader.read(16384)
+            # DO NOT CHANGE IT, it's a shadowsocks hack
+            data = await reader.read(UP_STREAM_BUF_SIZE)
         except ConnectionResetError:
             break
         except Exception as e:
@@ -103,13 +116,12 @@ async def forward_reader(
         while offset < total:
             size = random.randint(minsize, maxsize)
 
-            print(">>>>>>>>>>>>", offset, total, size)
             part = data[offset : offset + size]
             offset += size
 
-            logger.debug(
-                f"[{connection}] remote => local: {len(part)}, eos={offset >= total}, {part[:100]}"
-            )
+            # logger.debug(
+            #     f"[{connection}] remote => local: {len(part)}, eos={offset >= total}, {part[:100]}"
+            # )
 
             resp = RelayData(data=part, eos=offset >= total)
             try:
@@ -120,20 +132,17 @@ async def forward_reader(
                 logger.debug(f"[{connection}] closed reader with remote")
                 return
 
-        # logger.debug(f"[{connection}] remote => local: {len(data)}, {data[:100]}")
-
-        resp = RelayData(data=data)
-        msg = pack(obfs(resp))
-        await conn.send_multipart(msg)
-
         if not data:
             logger.debug(f"[{connection}] empty response from remote")
             break
 
-    await close_connection(connection)
+        imalive(connection)
+
     logger.debug(f"[{connection}] closed reader with remote")
+    await close_connection(connection)
 
 
+@logs_error
 async def forward_writer(
     connection: str,
     conn: zmq.Socket,
@@ -156,9 +165,9 @@ async def forward_writer(
                 outer_looping = False
                 continue
 
-            logger.debug(
-                f"[{connection}] local => remote: {len(resp.data)}, eos={resp.eos}, {resp.data[:100]}"
-            )
+            # logger.debug(
+            #     f"[{connection}] local => remote: {len(resp.data)}, eos={resp.eos}, {resp.data[:100]}"
+            # )
 
             # data are splited in server
             parts.append(resp.data)
@@ -166,41 +175,53 @@ async def forward_writer(
                 break
 
         data = b"".join(parts)
-        print("write", len(data), data[:100])
         writer.write(data)
 
         # do not add drain
         # it will slow down the program
         # await writer.drain()
 
+        imalive(connection)
+
     await close_connection(connection)
     try:
         await writer.drain()
     except:
         pass
-    writer.close()
     logger.debug(f"[{connection}] closed writer with local")
+    writer.close()
 
 
 async def close_connection(connection: str):
-    logger.debug(f"[{connection}] closing...")
     try:
-        (conn, _, _) = CONNECTIONS.pop(connection)
+        (conn, _, writer, taskr, taskw) = CONNECTIONS.pop(connection)
     except KeyError:
         logger.warning(f"connection {connection} is already closed!")
     else:
-        try:
-            await conn.send_multipart(
-                pack(obfs(RelayData(method=RelayMethod.CLOSE, data=b"close")))
-            )
+        taskr.cancel()
+        taskw.cancel()
+        writer.close()
+        conn.close()
 
-            async def close_later(seconds: float = 1):
-                await asyncio.sleep(seconds)
-                conn.close()
 
-            asyncio.create_task(close_later(seconds=10))
-        except zmq.error.ZMQError:
-            logger.exception("zmq socket already closed")
+def imalive(connection: str):
+    LAST_ACTIVITY_TIMES[connection] = time.time()
+
+
+@logs_error
+async def house_keeper(housekeep_interval=10, keep_alive=60):
+    while True:
+        await asyncio.sleep(housekeep_interval)
+        logger.debug("house keeping...")
+        to_close = []
+        for connection in CONNECTIONS:
+            if time.time() - LAST_ACTIVITY_TIMES.get(connection, 0) > keep_alive:
+                to_close.append(connection)
+                LAST_ACTIVITY_TIMES.pop(connection, None)
+        for connection in to_close:
+            await close_connection(connection)
+
+        logger.debug(f"house keeped, removed {len(to_close)} stale connections")
 
 
 HANDLERS = {

@@ -117,6 +117,10 @@ async def negotiate_socks(
         writer.write(GENERAL_FAILURE)
         return False
     else:
+        if not addr:
+            writer.write(GENERAL_FAILURE)
+            return False
+
         writer.write(addr.to_bytes())
         await writer.drain()
 
@@ -127,11 +131,16 @@ async def negotiate_socks(
 async def handshake(
     reader: asyncio.StreamReader, writer: asyncio.StreamWriter, conf=get_config()
 ) -> bool:
-    header = await reader.read(2)
-    version, nmethods = struct.unpack("!BB", header)
+    try:
+        header = await reader.read(2)
+        version, nmethods = struct.unpack("!BB", header)
+    except struct.error:
+        # client connects and disconnect immediately
+        return False
 
-    assert version == Version.SOCKS5
-    assert nmethods > 0
+    if version != Version.SOCKS5 or nmethods <= 0:
+        writer.write(NO_ACCEPTABLE_METHOD)
+        return False
 
     # get available methods
     methods = set()

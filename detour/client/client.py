@@ -1,20 +1,18 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-from sre_parse import parse_template
 import zmq
+import time
 import random
 import asyncio
-import logging
 import functools
 from zmq.asyncio import Context
-from typing import Any, Callable, Coroutine, cast
-
-from shadowsocks import cryptor
+from typing import Any, Callable, Coroutine, Dict, Tuple, cast
 
 from ..schema import RelayMethod, RelayRequest, RelayResponse, RelayData
 from ..relay import deobfs, obfs, pack, unpack_response, unpack_data
 from ..logger import logger
 from ..config import get_config
+from ..utils import logs_error
 
 
 from .socks5 import AddrType, Address, negotiate_socks, Socks5Request
@@ -22,6 +20,18 @@ from .shadow import negotiate_shadow, wrap_cryptor
 
 
 CLOSE_MSG = pack(obfs(RelayData(method=RelayMethod.CLOSE, data=b"close")))
+DOWN_STREAM_BUF_SIZE = 32 * 1024
+CONNECTIONS: Dict[
+    str,
+    Tuple[
+        zmq.Socket,
+        asyncio.StreamReader,
+        asyncio.StreamWriter,
+        asyncio.Task,
+        asyncio.Task,
+    ],
+] = {}
+LAST_ACTIVITY_TIMES: Dict[str, float] = {}
 
 
 async def run_client():
@@ -29,6 +39,8 @@ async def run_client():
 
     # local servers
     servers = []
+
+    asyncio.create_task(house_keeper())
 
     # socks5 server
     if conf.get("client_listen_socks5"):
@@ -53,16 +65,9 @@ async def run_client():
         assert conf["client_listen_shadow"].startswith("tcp://")
 
         client_ip, client_port_shadow = conf["client_listen_shadow"][6:].split(":")
-        cipher = cryptor.Cryptor(
-            get_config()["client_shadow_password"], get_config()["client_shadow_method"]
-        )
-
-        # Remove all handlers associated with the root logger object.
-        for handler in logging.root.handlers[:]:
-            logging.root.removeHandler(handler)
 
         conn_shadow = await asyncio.start_server(
-            functools.partial(handle_local, negotiate_shadow, cipher),
+            functools.partial(handle_local, negotiate_shadow, True),
             client_ip,
             int(client_port_shadow),
         )
@@ -93,6 +98,7 @@ async def run_client():
         logger.error("please specify socks5/shadowsocks server to listen")
 
 
+@logs_error
 async def handle_local(
     negotiate: Callable[
         [
@@ -118,6 +124,8 @@ async def handle_local(
     conf = get_config()
     hconn = ctx.socket(zmq.DEALER)  # handshake conn
     sconn = ctx.socket(zmq.PAIR)  # stream conn
+    hconn.setsockopt(zmq.LINGER, 0)
+    sconn.setsockopt(zmq.LINGER, 0)
     connection = ""
 
     async def bind(req: Socks5Request) -> Address:
@@ -139,25 +147,31 @@ async def handle_local(
             sconn.connect(resp.connection)
             logger.debug(f"[{resp.connection}] connected")
         else:
-            raise RuntimeError(resp.msg)
+            return
 
         return Address(type=AddrType.IPv4, addr=resp.addr, port=resp.port)
 
     if cipher:
-        reader, writer = wrap_cryptor(cipher, reader, writer)
+        reader, writer = wrap_cryptor(reader, writer)
 
     # ok = await handle_socks(reader, writer, bind)
     ok = await negotiate(reader, writer, bind)
     if ok:
-        asyncio.create_task(forward_reader(connection, sconn, reader))
-        asyncio.create_task(forward_writer(connection, sconn, writer))
+        taskr = asyncio.create_task(forward_reader(connection, sconn, reader))
+        taskw = asyncio.create_task(forward_writer(connection, sconn, writer))
+        CONNECTIONS[connection] = (sconn, reader, writer, taskr, taskw)
+        imalive(connection)
     else:
         # byebye client
         writer.write(b"")
         await writer.drain()
         writer.close()
 
+    # avoid too many open files
+    hconn.close()
 
+
+@logs_error
 async def forward_reader(
     connection: str,
     conn: zmq.Socket,
@@ -168,7 +182,7 @@ async def forward_reader(
     while True:
         try:
             # DO NOT change this value
-            data = await reader.read(32768)
+            data = await reader.read(DOWN_STREAM_BUF_SIZE)
         except ConnectionResetError:
             break
         except Exception as e:
@@ -181,13 +195,12 @@ async def forward_reader(
         while offset < total:
             size = random.randint(minsize, maxsize)
 
-            print(">>>>>>>>>>>>", offset, total, size)
             part = data[offset : offset + size]
             offset += size
 
-            logger.debug(
-                f"[{connection}] local => remote: {len(part)}, eos={offset >= total}, {part[:100]}"
-            )
+            # logger.debug(
+            #     f"[{connection}] local => remote: {len(part)}, eos={offset >= total}, {part[:20]}"
+            # )
 
             resp = RelayData(data=part, eos=offset >= total)
             await conn.send_multipart(pack(obfs(resp)))
@@ -197,9 +210,13 @@ async def forward_reader(
             await conn.send_multipart(CLOSE_MSG)
             break
 
+        imalive(connection)
+
     logger.debug(f"[{connection}] closed reader with remote")
+    close_connection(connection)
 
 
+@logs_error
 async def forward_writer(
     connection: str,
     conn: zmq.Socket,
@@ -223,9 +240,10 @@ async def forward_writer(
                     outer_looping = False
                     continue
 
-                logger.debug(
-                    f"[{connection}] remote => local: {len(resp.data)}, eos={resp.eos}, {resp.data[:100]}"
-                )
+                # logger.debug(
+                #     f"[{connection}] remote => local: {len(resp.data)}, eos={resp.eos}, {resp.data[:20]}"
+                # )
+
                 # data are splited in server
                 parts.append(resp.data)
                 if resp.eos:
@@ -233,18 +251,48 @@ async def forward_writer(
 
         # we MUST do a single write here, because shadowsocks assumes a whole packet
         data = b"".join(parts)
-        print("write", len(data), data[:100])
         writer.write(data)
 
         try:
             await writer.drain()
         except ConnectionResetError:
-            logger.error("reset!!!!")
             break
 
-    conn.close()
-    writer.close()
+        imalive(connection)
+
     logger.debug(f"[{connection}] closed writer with local")
+    close_connection(connection)
+
+
+def close_connection(connection: str):
+    try:
+        (conn, _, writer, taskr, taskw) = CONNECTIONS.pop(connection)
+    except KeyError:
+        logger.warning(f"connection {connection} is already closed!")
+    else:
+        taskr.cancel()
+        taskw.cancel()
+        writer.close()
+        conn.close()
+
+
+def imalive(connection: str):
+    LAST_ACTIVITY_TIMES[connection] = time.time()
+
+
+@logs_error
+async def house_keeper(housekeep_interval=10, keep_alive=60):
+    while True:
+        await asyncio.sleep(housekeep_interval)
+        logger.debug("house keeping...")
+        to_close = []
+        for connection in CONNECTIONS:
+            if time.time() - LAST_ACTIVITY_TIMES.get(connection, 0) > keep_alive:
+                to_close.append(connection)
+                LAST_ACTIVITY_TIMES.pop(connection, None)
+        for connection in to_close:
+            close_connection(connection)
+        logger.debug(f"house keeped, removed {len(to_close)} stale connections")
 
 
 def main():

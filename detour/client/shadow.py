@@ -6,6 +6,7 @@ ShadowSocks Server
 import struct
 import socket
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from typing import Coroutine, Callable, Any, List
 from xml.dom.expatbuilder import parseString
@@ -31,7 +32,11 @@ async def negotiate_shadow(
     listen = f"tcp://{sockname[0]}:{sockname[1]}"
     peer = f"tcp://{peername[0]}:{peername[1]}"
 
-    address_type = ord(await reader.read(1))
+    try:
+        address_type = ord(await reader.read(1))
+    except TypeError:
+        # reads b'', a client connects and disconnects immediately
+        return False
     if address_type == AddrType.IPv4:
         address = socket.inet_ntoa(await reader.read(4))
     elif address_type == AddrType.IPv6:
@@ -51,11 +56,13 @@ async def negotiate_shadow(
     logger.debug(f"[{listen}] shadowsocks recv <=== {peer}: {req}")
 
     try:
-        await bind(req)
+        addr = await bind(req)
     except Exception as e:
         logger.exception(str(e))
         return False
     else:
+        if not addr:
+            return False
         # it's time to start forwarding (in caller function)
         return True
 
@@ -116,8 +123,16 @@ class IOBuffer:
         self.buflen += len(data)
 
 
-def wrap_cryptor(cipher, reader, writer):
-    cipher = cryptor.Cryptor("yb160101", "chacha20-ietf-poly1305")
+def wrap_cryptor(reader, writer):
+    conf = get_config()
+    cipher = cryptor.Cryptor(
+        conf["client_shadow_password"], conf["client_shadow_method"]
+    )
+
+    # Remove all handlers associated with the root logger object.
+    for handler in logging.root.handlers[:]:
+        logging.root.removeHandler(handler)
+
     old_read = reader.read
     old_write = writer.write
     reader_buffer = IOBuffer()
@@ -125,21 +140,16 @@ def wrap_cryptor(cipher, reader, writer):
     async def new_read(n: int = -1) -> bytes:
         if not reader_buffer.has_more():
             data = await old_read(DOWN_STREAM_BUF_SIZE)
-            print("new real read", len(data), data[:100])
-            # print(data)
             try:
                 data = cipher.decrypt(data)
             except:
                 logger.error("decrypt failed")
-                parseString
             reader_buffer.append_data(data)
         data = reader_buffer.get(n)
-        print("new read", n, data[:100])
         return data
 
     def new_write(data: bytes):
         data = cipher.encrypt(data)
-        print("new write", len(data), data[:100])
         old_write(data)
 
     reader.read = new_read

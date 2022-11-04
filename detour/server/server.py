@@ -9,17 +9,20 @@ import asyncio
 from zmq.asyncio import Context
 from typing import List, cast
 
+from detour.utils import logs_error
+
 from ..schema import RelayMessage, RelayMethod, RelayRequest, RelayResponse
 from ..relay import deobfs, obfs, pack, unpack_request
 from ..logger import logger
 from ..config import SERVER_LISTEN, get_config
-from .handlers import HANDLERS
+from .handlers import HANDLERS, house_keeper
 
 
 async def run_server():
     conf = get_config()
     ctx = Context.instance()
     conn = ctx.socket(zmq.ROUTER)
+    conn.setsockopt(zmq.LINGER, 0)
     connection = conf["server_listen"]
     conn.bind(connection)
 
@@ -32,6 +35,7 @@ async def run_server():
         got_listen = True
 
     logger.info(f"start listening on {connection}")
+    asyncio.create_task(house_keeper())
 
     while True:
         logger.debug(f"[{connection}] waiting for request")
@@ -58,6 +62,7 @@ async def run_server():
             asyncio.create_task(handle_request(conn, req, msgid))
 
 
+@logs_error
 async def handle_request(conn: zmq.Socket, req: RelayRequest, msgid: bytes):
     try:
         resp = await HANDLERS[req.method](req)
